@@ -1,0 +1,392 @@
+```html
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Billard Américain</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #0a0a0a; touch-action: none;
+    display: flex; flex-direction: column; align-items: center;
+    height: 100%; font-family: -apple-system, sans-serif;
+  }
+  #hud {
+    width: 100%; max-width: 380px;
+    display: flex; justify-content: space-between;
+    color: #eee; padding: 8px 14px; box-sizing: border-box;
+    font-size: 14px;
+  }
+  .player { padding: 4px 10px; border-radius: 6px; background: #222; }
+  .player.active { background: #c0392b; }
+  #message {
+    position: fixed; top: 52px; left: 0; right: 0;
+    text-align: center; color: #ffd166; font-size: 13px;
+    pointer-events: none; min-height: 18px;
+  }
+  canvas { border-radius: 12px; touch-action: none; }
+  #tableWrap {
+    position: relative;
+    border: 16px solid #4a2d18;
+    border-radius: 14px;
+    background: #3a2313;
+    box-shadow: inset 0 0 20px rgba(0,0,0,0.6), 0 15px 25px rgba(0,0,0,0.7);
+  }
+  #soundBtn {
+    margin-top: 10px; padding: 8px 16px; border-radius: 20px;
+    border: none; background: #333; color: #eee; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="player active" id="p1">Joueur 1 — 0</div>
+  <div class="player" id="p2">Joueur 2 — 0</div>
+</div>
+<div id="message">Glisse depuis la boule blanche pour viser</div>
+<div id="tableWrap">
+  <canvas id="table"></canvas>
+</div>
+<button id="soundBtn">🔊 Activer le son</button>
+
+<script>
+// ---- AUDIO ----
+let audioCtx = null;
+document.getElementById('soundBtn').addEventListener('click', () => {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  document.getElementById('soundBtn').style.display = 'none';
+});
+
+function playTone(freq, duration, type, volume) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function sfxBallHit(speed) {
+  const vol = Math.min(speed / 15, 1) * 0.25;
+  playTone(300 + Math.random()*150, 0.08, 'triangle', vol);
+}
+function sfxWallHit(speed) {
+  const vol = Math.min(speed / 15, 1) * 0.18;
+  playTone(120 + Math.random()*40, 0.1, 'square', vol);
+}
+function sfxPocket() {
+  playTone(600, 0.06, 'sine', 0.2);
+  setTimeout(() => playTone(400, 0.12, 'sine', 0.2), 60);
+  setTimeout(() => playTone(250, 0.18, 'sine', 0.15), 140);
+}
+function sfxCueStrike(power) {
+  playTone(80, 0.05, 'square', Math.min(power/15,1)*0.3);
+}
+
+// ---- JEU ----
+const canvas = document.getElementById('table');
+const ctx = canvas.getContext('2d');
+
+let W = Math.min(window.innerWidth * 0.92, 360);
+let H = W * 2;
+canvas.width = W;
+canvas.height = H;
+
+const R = W / 36;
+const FRICTION = 0.986;
+const MIN_SPEED = 0.03;
+
+const pockets = [
+  {x: 0, y: 0}, {x: W/2, y: 0}, {x: W, y: 0},
+  {x: 0, y: H}, {x: W/2, y: H}, {x: W, y: H}
+];
+const POCKET_R = R * 1.7;
+
+const ballDefs = [
+  {n:1,color:'#f1c40f',stripe:false}, {n:2,color:'#2980b9',stripe:false},
+  {n:3,color:'#e74c3c',stripe:false}, {n:4,color:'#8e44ad',stripe:false},
+  {n:5,color:'#e67e22',stripe:false}, {n:6,color:'#1e824c',stripe:false},
+  {n:7,color:'#7b241c',stripe:false}, {n:8,color:'#111111',stripe:false},
+  {n:9,color:'#f1c40f',stripe:true}, {n:10,color:'#2980b9',stripe:true},
+  {n:11,color:'#e74c3c',stripe:true}, {n:12,color:'#8e44ad',stripe:true},
+  {n:13,color:'#e67e22',stripe:true}, {n:14,color:'#1e824c',stripe:true},
+  {n:15,color:'#7b241c',stripe:true},
+];
+
+let balls, state, shotResolved = true;
+
+function resetGame() {
+  balls = [{x: W/2, y: H*0.78, vx:0, vy:0, active:true, isCue:true, n:0}];
+  const startY = H * 0.22;
+  const order = [1,9,2,10,8,3,11,4,12,5,13,6,14,7,15];
+  let i = 0;
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col <= row; col++) {
+      const x = W/2 - row * R * 1.02 + col * R * 2.04;
+      const y = startY + row * R * 1.85;
+      const def = ballDefs[order[i]-1];
+      balls.push({x, y, vx:0, vy:0, active:true, isCue:false, n:def.n, color:def.color, stripe:def.stripe});
+      i++;
+    }
+  }
+  state = {
+    turn: 1, scores: {1:0,2:0}, groups: {1:null,2:null},
+    message: 'Glisse depuis la boule blanche pour viser', gameOver: false
+  };
+  updateHUD();
+}
+
+function updateHUD() {
+  document.getElementById('p1').textContent = 'Joueur 1 — ' + state.scores[1];
+  document.getElementById('p2').textContent = 'Joueur 2 — ' + state.scores[2];
+  document.getElementById('p1').className = 'player' + (state.turn===1?' active':'');
+  document.getElementById('p2').className = 'player' + (state.turn===2?' active':'');
+  document.getElementById('message').textContent = state.message;
+}
+
+let aiming=false, dragStart=null, dragCurrent=null;
+function getCueBall(){ return balls.find(b=>b.isCue); }
+function pointerPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return { x:(t.clientX-rect.left)*(canvas.width/rect.width), y:(t.clientY-rect.top)*(canvas.height/rect.height) };
+}
+canvas.addEventListener('touchstart', onStart, {passive:false});
+canvas.addEventListener('mousedown', onStart);
+canvas.addEventListener('touchmove', onMove, {passive:false});
+canvas.addEventListener('mousemove', onMove);
+canvas.addEventListener('touchend', onEnd);
+canvas.addEventListener('mouseup', onEnd);
+
+function allStopped(){ return balls.every(b=>!b.active||(Math.abs(b.vx)<MIN_SPEED&&Math.abs(b.vy)<MIN_SPEED)); }
+
+function onStart(e){
+  e.preventDefault();
+  if (!allStopped()||state.gameOver) return;
+  const cue=getCueBall();
+  if(!cue||!cue.active) return;
+  aiming=true; dragStart=pointerPos(e); dragCurrent=dragStart;
+}
+function onMove(e){ if(!aiming) return; e.preventDefault(); dragCurrent=pointerPos(e); }
+function onEnd(e){
+  if(!aiming) return;
+  aiming=false;
+  const cue=getCueBall();
+  if(!cue||!dragStart||!dragCurrent) return;
+  const dx=dragStart.x-dragCurrent.x, dy=dragStart.y-dragCurrent.y;
+  const power=Math.min(Math.hypot(dx,dy)*0.13,15);
+  if(power>0.5){
+    const dist=Math.hypot(dx,dy)||1;
+    cue.vx=(dx/dist)*power; cue.vy=(dy/dist)*power;
+    sfxCueStrike(power);
+  }
+  dragStart=null; dragCurrent=null;
+}
+
+function resolveWalls(b){
+  let hit=false;
+  if(b.x-R<0){b.x=R;b.vx*=-0.92;hit=true;}
+  if(b.x+R>W){b.x=W-R;b.vx*=-0.92;hit=true;}
+  if(b.y-R<0){b.y=R;b.vy*=-0.92;hit=true;}
+  if(b.y+R>H){b.y=H-R;b.vy*=-0.92;hit=true;}
+  if(hit){
+    const speed=Math.hypot(b.vx,b.vy);
+    if(speed>0.3) sfxWallHit(speed);
+  }
+}
+
+function resolveBallCollisions(){
+  for(let i=0;i<balls.length;i++){
+    for(let j=i+1;j<balls.length;j++){
+      const a=balls[i], b=balls[j];
+      if(!a.active||!b.active) continue;
+      const dx=b.x-a.x, dy=b.y-a.y;
+      const dist=Math.hypot(dx,dy);
+      if(dist<R*2 && dist>0){
+        const nx=dx/dist, ny=dy/dist;
+        const overlap=R*2-dist;
+        a.x-=nx*overlap/2; a.y-=ny*overlap/2;
+        b.x+=nx*overlap/2; b.y+=ny*overlap/2;
+        const avn=a.vx*nx+a.vy*ny, bvn=b.vx*nx+b.vy*ny;
+        const relSpeed = Math.abs(avn-bvn);
+        a.vx+=(bvn-avn)*nx; a.vy+=(bvn-avn)*ny;
+        b.vx+=(avn-bvn)*nx; b.vy+=(avn-bvn)*ny;
+        if(relSpeed>0.25) sfxBallHit(relSpeed);
+      }
+    }
+  }
+}
+
+function endTurn(foul,pocketedOwn){
+  if(foul){
+    state.message='Faute ! Au joueur '+(state.turn===1?2:1);
+    state.turn=state.turn===1?2:1;
+  } else if(!pocketedOwn){
+    state.turn=state.turn===1?2:1;
+    state.message='Au joueur '+state.turn;
+  } else {
+    state.message='Bien joué ! Rejoue, joueur '+state.turn;
+  }
+  updateHUD();
+}
+
+function checkPocketsOnce(){
+  let cuePocketed=false, pocketedOwnGroup=false, eightPocketed=false, anyPocketed=false;
+  for(const b of balls){
+    if(b.active || b._handled) continue;
+    b._handled=true;
+    anyPocketed=true;
+    sfxPocket();
+    if(b.isCue){ cuePocketed=true; continue; }
+    if(b.n===8){ eightPocketed=true; continue; }
+    state.scores[state.turn]++;
+    if(!state.groups[1] && !state.groups[2]){
+      state.groups[state.turn]=b.stripe?'stripe':'full';
+      state.groups[state.turn===1?2:1]=b.stripe?'full':'stripe';
+    }
+    const myGroup=state.groups[state.turn];
+    if(!myGroup || b.stripe===(myGroup==='stripe')) pocketedOwnGroup=true;
+  }
+
+  if(eightPocketed){
+    const myGroup=state.groups[state.turn];
+    const myBalls=balls.filter(x=>!x.isCue&&x.n!==8&&myGroup&&x.stripe===(myGroup==='stripe'));
+    const cleared=myGroup?myBalls.every(x=>!x.active):false;
+    state.gameOver=true;
+    state.message=cleared?('🏆 Joueur '+state.turn+' GAGNE !'):('💀 Boule noire trop tôt ! Joueur '+(state.turn===1?2:1)+' gagne !');
+    updateHUD();
+    return;
+  }
+  if(cuePocketed){
+    setTimeout(()=>{ const cue=getCueBall(); cue.x=W/2; cue.y=H*0.78; cue.vx=0; cue.vy=0; cue.active=true; },400);
+    endTurn(true,false);
+    return;
+  }
+  if(!anyPocketed) endTurn(false,false);
+  else if(pocketedOwnGroup) endTurn(false,true);
+  else endTurn(false,false);
+}
+
+function update(){
+  let moving=false;
+  for(const b of balls){
+    if(!b.active) continue;
+    b.x+=b.vx; b.y+=b.vy;
+    b.vx*=FRICTION; b.vy*=FRICTION;
+    if(Math.abs(b.vx)<MIN_SPEED) b.vx=0;
+    if(Math.abs(b.vy)<MIN_SPEED) b.vy=0;
+    if(b.vx!==0||b.vy!==0) moving=true;
+    resolveWalls(b);
+  }
+  resolveBallCollisions();
+  for(const p of pockets){
+    for(const b of balls){
+      if(!b.active) continue;
+      if(Math.hypot(b.x-p.x,b.y-p.y)<POCKET_R) b.active=false;
+    }
+  }
+  if(moving) shotResolved=false;
+  if(!moving && !shotResolved){ shotResolved=true; checkPocketsOnce(); }
+}
+
+function drawBall(b){
+  if(!b.active) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(b.x,b.y+R*0.35,R*0.9,0,Math.PI*2);
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  ctx.filter='blur(2px)';
+  ctx.fill();
+  ctx.filter='none';
+  ctx.restore();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(b.x,b.y,R,0,Math.PI*2);
+  ctx.closePath();
+  ctx.clip();
+  if(b.isCue){
+    ctx.fillStyle='#f5f5f0';
+    ctx.fillRect(b.x-R,b.y-R,R*2,R*2);
+  } else if(b.stripe){
+    ctx.fillStyle='#f5f5f0';
+    ctx.fillRect(b.x-R,b.y-R,R*2,R*2);
+    ctx.fillStyle=b.color;
+    ctx.fillRect(b.x-R,b.y-R*0.55,R*2,R*1.1);
+  } else {
+    ctx.fillStyle=b.color;
+    ctx.fillRect(b.x-R,b.y-R,R*2,R*2);
+  }
+  const grad=ctx.createRadialGradient(b.x-R*0.4,b.y-R*0.4,R*0.1,b.x,b.y,R*1.3);
+  grad.addColorStop(0,'rgba(255,255,255,0.55)');
+  grad.addColorStop(0.3,'rgba(255,255,255,0.1)');
+  grad.addColorStop(1,'rgba(0,0,0,0.25)');
+  ctx.fillStyle=grad;
+  ctx.fillRect(b.x-R,b.y-R,R*2,R*2);
+  ctx.restore();
+
+  if(!b.isCue){
+    ctx.beginPath();
+    ctx.arc(b.x,b.y,R*0.42,0,Math.PI*2);
+    ctx.fillStyle='#f5f5f0';
+    ctx.fill();
+    ctx.fillStyle='#111';
+    ctx.font=(R*0.55)+'px sans-serif';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.fillText(b.n,b.x,b.y+1);
+  }
+  ctx.beginPath();
+  ctx.arc(b.x,b.y,R,0,Math.PI*2);
+  ctx.strokeStyle='rgba(0,0,0,0.4)';
+  ctx.lineWidth=1;
+  ctx.stroke();
+}
+
+function draw(){
+  const felt=ctx.createRadialGradient(W/2,H/2,20,W/2,H/2,H*0.7);
+  felt.addColorStop(0,'#0f6b38');
+  felt.addColorStop(1,'#0a4e28');
+  ctx.fillStyle=felt;
+  ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='rgba(255,255,255,0.12)';
+  ctx.lineWidth=2;
+  ctx.strokeRect(10,10,W-20,H-20);
+  for(const p of pockets){
+    const g=ctx.createRadialGradient(p.x,p.y,1,p.x,p.y,POCKET_R);
+    g.addColorStop(0,'#000'); g.addColorStop(1,'#222');
+    ctx.beginPath(); ctx.arc(p.x,p.y,POCKET_R,0,Math.PI*2);
+    ctx.fillStyle=g; ctx.fill();
+  }
+  for(const b of balls) drawBall(b);
+  if(aiming && dragStart && dragCurrent){
+    const cue=getCueBall();
+    if(cue){
+      const dx=dragStart.x-dragCurrent.x, dy=dragStart.y-dragCurrent.y;
+      const dist=Math.hypot(dx,dy)||1;
+      const nx=dx/dist, ny=dy/dist;
+      ctx.beginPath();
+      ctx.moveTo(cue.x,cue.y);
+      ctx.lineTo(cue.x+nx*90,cue.y+ny*90);
+      ctx.strokeStyle='rgba(255,255,255,0.7)';
+      ctx.lineWidth=2;
+      ctx.setLineDash([5,5]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+function loop(){ update(); draw(); requestAnimationFrame(loop); }
+resetGame();
+loop();
+</script>
+</body>
+</html>
+```
